@@ -286,7 +286,7 @@ void PersistentTable::nextFreeTuple(TableTuple* tuple) {
     }
 }
 
-void PersistentTable::drLogTruncate(ExecutorContext* ec, bool fallible) {
+void PersistentTable::drLogTruncate(const ExecutorContext* ec, bool fallible) {
     AbstractDRTupleStream* drStream = getDRTupleStream(ec);
     if (doDRActions(drStream)) {
         int64_t currentSpHandle = ec->currentSpHandle();
@@ -304,12 +304,11 @@ void PersistentTable::drLogTruncate(ExecutorContext* ec, bool fallible) {
 
 void PersistentTable::deleteAllTuples(bool, bool fallible) {
     // Instead of recording each tuple deletion, log it as a table truncation DR.
-    ExecutorContext* ec = ExecutorContext::getExecutorContext();
-    drLogTruncate(ec, fallible);
+    drLogTruncate(m_executorContext, fallible);
 
     // Temporarily disable DR binary logging so that it doesn't record the
     // individual deletions below.
-    DRTupleStreamDisableGuard drGuard(ec, false);
+    DRTupleStreamDisableGuard drGuard(m_executorContext, false);
 
     // nothing interesting
     TableIterator ti(this, m_data.begin());
@@ -406,7 +405,7 @@ template<class T> static inline PersistentTable* constructEmptyDestTable(
 void PersistentTable::truncateTable(VoltDBEngine* engine, bool replicatedTable, bool fallible) {
     if (isPersistentTableEmpty()) {
         // Always log the the truncate if dr is enabled, see ENG-14528.
-        drLogTruncate(ExecutorContext::getExecutorContext(), fallible);
+        drLogTruncate(m_executorContext, fallible);
         return;
     }
 
@@ -538,10 +537,9 @@ void PersistentTable::truncateTable(VoltDBEngine* engine, bool replicatedTable, 
 
     engine->rebuildTableCollections(replicatedTable, false);
 
-    ExecutorContext* ec = ExecutorContext::getExecutorContext();
-    drLogTruncate(ec, fallible);
+    drLogTruncate(m_executorContext, fallible);
 
-    UndoQuantum* uq = ec->getCurrentUndoQuantum();
+    UndoQuantum* uq = m_executorContext->getCurrentUndoQuantum();
     if (uq) {
         if (!fallible) {
             throwFatalException("Attempted to truncate table %s when there was an "
@@ -833,12 +831,10 @@ void PersistentTable::doInsertTupleCommon(TableTuple& source, TableTuple& target
         setDRTimestampForTuple(target, false);
     }
 
-    ExecutorContext* ec = ExecutorContext::getExecutorContext();
-    AbstractDRTupleStream* drStream = getDRTupleStream(ec);
+    AbstractDRTupleStream* drStream = getDRTupleStream(m_executorContext);
     if (doDRActions(drStream) && shouldDRStream) {
-        ExecutorContext* ec = ExecutorContext::getExecutorContext();
-        int64_t currentSpHandle = ec->currentSpHandle();
-        int64_t currentUniqueId = ec->currentUniqueId();
+        int64_t currentSpHandle = m_executorContext->currentSpHandle();
+        int64_t currentUniqueId = m_executorContext->currentUniqueId();
         size_t drMark = drStream->appendTuple(m_signature, m_partitionColumn, currentSpHandle,
                                               currentUniqueId, target, DR_RECORD_INSERT);
 
@@ -910,7 +906,7 @@ void PersistentTable::doInsertTupleCommon(TableTuple& source, TableTuple& target
                 vassert(m_shadowStream != nullptr);
 
                 // insert to partitioned table or partition id 0 for replicated
-                if (!isReplicatedTable() || ec->getPartitionId() == 0) {
+                if (!isReplicatedTable() || m_executorContext->getPartitionId() == 0) {
                      m_shadowStream->streamTuple(target, ExportTupleStream::STREAM_ROW_TYPE::INSERT);
                 }
             }
@@ -987,7 +983,6 @@ void PersistentTable::updateTupleWithSpecificIndexes(
     UndoQuantum* uq = NULL;
     char* oldTupleData = NULL;
     int tupleLength = targetTupleToUpdate.tupleLength();
-    ExecutorContext* ec = ExecutorContext::getExecutorContext();
 
     /**
      * Check for index constraint violations.
@@ -1014,7 +1009,7 @@ void PersistentTable::updateTupleWithSpecificIndexes(
              */
            oldTupleData = partialCopyToPool(uq->getPool(), targetTupleToUpdate.address(), targetTupleToUpdate.tupleLength());
            // We assume that only fallible and undoable UPDATEs should be propagated to the EXPORT Shadow Stream
-           if (!isReplicatedTable() || ec->getPartitionId() == 0) {
+           if (!isReplicatedTable() || m_executorContext->getPartitionId() == 0) {
                if (isTableWithExportUpdateOld(m_tableType)) {
                    m_shadowStream->streamTuple(targetTupleToUpdate, ExportTupleStream::STREAM_ROW_TYPE::UPDATE_OLD);
                }
@@ -1045,10 +1040,10 @@ void PersistentTable::updateTupleWithSpecificIndexes(
        }
     }
 
-    AbstractDRTupleStream* drStream = getDRTupleStream(ec);
+    AbstractDRTupleStream* drStream = getDRTupleStream(m_executorContext);
     if (!fromMigrate && doDRActions(drStream)) {
-        int64_t currentSpHandle = ec->currentSpHandle();
-        int64_t currentUniqueId = ec->currentUniqueId();
+        int64_t currentSpHandle = m_executorContext->currentSpHandle();
+        int64_t currentUniqueId = m_executorContext->currentUniqueId();
         size_t drMark = drStream->appendUpdateRecord(m_signature, m_partitionColumn, currentSpHandle,
                 currentUniqueId, targetTupleToUpdate, sourceTupleWithNewValues);
 
@@ -1139,7 +1134,7 @@ void PersistentTable::updateTupleWithSpecificIndexes(
         vassert(isTableWithMigrate(m_tableType) && m_shadowStream != nullptr);
         migratingAdd(getTableTxnId(), targetTupleToUpdate);
         // add to shadow stream if the table is partitioned or partition 0 for replicated table
-        if (!isReplicatedTable() || ec->getPartitionId() == 0) {
+        if (!isReplicatedTable() || m_executorContext->getPartitionId() == 0) {
             m_shadowStream->streamTuple(sourceTupleWithNewValues, ExportTupleStream::MIGRATE, doDRActions(drStream) ? drStream : NULL);
         }
     }
@@ -1277,11 +1272,10 @@ void PersistentTable::deleteTuple(TableTuple& target, bool fallible, bool remove
 
     // Write to the DR stream before doing anything else to ensure nothing will
     // be left forgotten in case this throws.
-    ExecutorContext* ec = ExecutorContext::getExecutorContext();
-    AbstractDRTupleStream* drStream = getDRTupleStream(ec);
+    AbstractDRTupleStream* drStream = getDRTupleStream(m_executorContext);
     if (doDRActions(drStream)) {
-        int64_t currentSpHandle = ec->currentSpHandle();
-        int64_t currentUniqueId = ec->currentUniqueId();
+        int64_t currentSpHandle = m_executorContext->currentSpHandle();
+        int64_t currentUniqueId = m_executorContext->currentUniqueId();
         size_t drMark = drStream->appendTuple(m_signature, m_partitionColumn, currentSpHandle,
                                               currentUniqueId, target, DR_RECORD_DELETE);
 
@@ -1308,7 +1302,7 @@ void PersistentTable::deleteTuple(TableTuple& target, bool fallible, bool remove
         SynchronizedThreadLock::addUndoAction(isReplicatedTable(), uq, undoAction, this);
         if (isTableWithExportDeletes(m_tableType)) {
             vassert(m_shadowStream != nullptr);
-            if (!isReplicatedTable() || ec->getPartitionId() == 0) {
+            if (!isReplicatedTable() || m_executorContext->getPartitionId() == 0) {
                 m_shadowStream->streamTuple(target, ExportTupleStream::STREAM_ROW_TYPE::DELETE);
             }
         }
@@ -2204,7 +2198,7 @@ void PersistentTableSurgeon::activateSnapshot() {
 
 std::pair<TableIndex const*, uint32_t> PersistentTable::getUniqueIndexForDR() {
     // In active-active we always send full tuple instead of just index tuple.
-    bool isActiveActive = ExecutorContext::getExecutorContext()->getEngine()->getIsActiveActiveDREnabled();
+    bool isActiveActive = m_executorContext->getEngine()->getIsActiveActiveDREnabled();
     if (isActiveActive) {
         TableIndex* nullIndex = NULL;
         return std::make_pair(nullIndex, 0);
